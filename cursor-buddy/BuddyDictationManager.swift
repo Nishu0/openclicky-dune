@@ -20,6 +20,7 @@ enum BuddyPushToTalkShortcut {
         case shiftControl
         case controlOptionSpace
         case shiftControlSpace
+        case controlOptionK
 
         var displayText: String {
             switch self {
@@ -33,6 +34,8 @@ enum BuddyPushToTalkShortcut {
                 return "ctrl + option + space"
             case .shiftControlSpace:
                 return "shift + control + space"
+            case .controlOptionK:
+                return "ctrl + option + k"
             }
         }
 
@@ -48,6 +51,8 @@ enum BuddyPushToTalkShortcut {
                 return ["ctrl", "option", "space"]
             case .shiftControlSpace:
                 return ["shift", "control", "space"]
+            case .controlOptionK:
+                return ["ctrl", "option", "k"]
             }
         }
 
@@ -59,12 +64,15 @@ enum BuddyPushToTalkShortcut {
                 return [.control, .option]
             case .shiftControl:
                 return [.shift, .control]
-            case .controlOptionSpace, .shiftControlSpace:
+            case .controlOptionSpace, .shiftControlSpace, .controlOptionK:
                 return nil
             }
         }
 
-        fileprivate var spaceShortcutModifierFlags: NSEvent.ModifierFlags? {
+        // Modifier flags that must accompany the trigger key for key-based
+        // shortcuts (anything that is not modifier-only). Returns nil for the
+        // modifier-only options above.
+        fileprivate var keyShortcutModifierFlags: NSEvent.ModifierFlags? {
             switch self {
             case .shiftFunction:
                 return nil
@@ -76,6 +84,19 @@ enum BuddyPushToTalkShortcut {
                 return [.control, .option]
             case .shiftControlSpace:
                 return [.shift, .control]
+            case .controlOptionK:
+                return [.control, .option]
+            }
+        }
+
+        // The non-modifier trigger key for key-based shortcuts. Unused by the
+        // modifier-only options (their transitions come from flagsChanged).
+        fileprivate var triggerKeyCode: UInt16 {
+            switch self {
+            case .controlOptionK:
+                return 40 // K
+            default:
+                return 49 // Space
             }
         }
     }
@@ -92,10 +113,15 @@ enum BuddyPushToTalkShortcut {
         case keyUp
     }
 
-    static let currentShortcutOption: ShortcutOption = .controlOption
-    static let pushToTalkKeyCode: UInt16 = 49 // Space
+    static let currentShortcutOption: ShortcutOption = .controlOptionK
+    static var pushToTalkKeyCode: UInt16 { currentShortcutOption.triggerKeyCode }
     static let pushToTalkDisplayText = currentShortcutOption.displayText
     static let pushToTalkTooltipText = "push to talk (\(pushToTalkDisplayText))"
+
+    // When true, the activation shortcut toggles dictation: tap once to start
+    // listening, tap again to stop. When false it behaves as press-and-hold.
+    // Toggle suits a macropad button that emits a single discrete keypress.
+    static let usesToggleActivation = true
 
     static func shortcutTransition(
         for event: NSEvent,
@@ -176,7 +202,7 @@ enum BuddyPushToTalkShortcut {
             return .none
         }
 
-        guard let pushToTalkModifierFlags = currentShortcutOption.spaceShortcutModifierFlags else {
+        guard let pushToTalkModifierFlags = currentShortcutOption.keyShortcutModifierFlags else {
             return .none
         }
 

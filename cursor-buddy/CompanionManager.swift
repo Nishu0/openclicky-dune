@@ -4017,6 +4017,13 @@ final class CompanionManager: ObservableObject {
     private func handleShortcutTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
         case .pressed:
+            // Toggle mode: a second tap while a session is active stops it.
+            if BuddyPushToTalkShortcut.usesToggleActivation
+                && !voiceActivationMode.usesWakeWord
+                && isShortcutDictationActive {
+                handleShortcutReleased()
+                return
+            }
             if voiceActivationMode.usesWakeWord {
                 guard !showOnboardingVideo else { return }
                 toggleWakeWordListeningFromShortcut()
@@ -4092,26 +4099,45 @@ final class CompanionManager: ObservableObject {
                 )
             }
         case .released:
-            if voiceActivationMode.usesWakeWord {
+            // Toggle mode ignores the real key-up; stopping happens on the
+            // next tap (handled in the .pressed branch above).
+            if BuddyPushToTalkShortcut.usesToggleActivation {
                 return
             }
-            // Cancel the pending start task in case the user released the shortcut
-            // before the async startPushToTalk had a chance to begin recording.
-            // Without this, a quick press-and-release drops the release event and
-            // leaves the waveform overlay stuck on screen indefinitely.
-            ClickyAnalytics.trackPushToTalkReleased()
-            pendingKeyboardShortcutStartTask?.cancel()
-            pendingKeyboardShortcutStartTask = nil
-            if finishBidirectionalRealtimeVoiceCaptureIfNeeded(source: "keyboardShortcut") {
-                return
-            }
-            // Keep the prewarmed screenshot — even on a quick press the user
-            // may still produce a final transcript (e.g. wake-word). The
-            // freshness check in the consumer discards stale captures.
-            buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+            handleShortcutReleased()
         case .none:
             break
         }
+    }
+
+    /// True while a keyboard/macropad-shortcut dictation session is starting,
+    /// recording, or finalizing. Used by toggle mode to decide whether the
+    /// next tap should start a new session or stop the current one.
+    private var isShortcutDictationActive: Bool {
+        isRealtimeBidirectionalVoiceCaptureActive
+            || pendingKeyboardShortcutStartTask != nil
+            || buddyDictationManager.isKeyboardShortcutSessionActiveOrFinalizing
+            || buddyDictationManager.isRecordingFromKeyboardShortcut
+    }
+
+    private func handleShortcutReleased() {
+        if voiceActivationMode.usesWakeWord {
+            return
+        }
+        // Cancel the pending start task in case the user released the shortcut
+        // before the async startPushToTalk had a chance to begin recording.
+        // Without this, a quick press-and-release drops the release event and
+        // leaves the waveform overlay stuck on screen indefinitely.
+        ClickyAnalytics.trackPushToTalkReleased()
+        pendingKeyboardShortcutStartTask?.cancel()
+        pendingKeyboardShortcutStartTask = nil
+        if finishBidirectionalRealtimeVoiceCaptureIfNeeded(source: "keyboardShortcut") {
+            return
+        }
+        // Keep the prewarmed screenshot — even on a quick press the user
+        // may still produce a final transcript (e.g. wake-word). The
+        // freshness check in the consumer discards stale captures.
+        buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
     }
 
     private var shouldUseBidirectionalRealtimeVoiceInput: Bool {

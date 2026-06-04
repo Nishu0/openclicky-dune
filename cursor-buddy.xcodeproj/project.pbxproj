@@ -473,7 +473,7 @@
 				COPY_PHASE_STRIP = NO;
 				CURRENT_PROJECT_VERSION = 6;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = SW75ZJJ5R6;
+				DEVELOPMENT_TEAM = UPL3NFSPL2;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
@@ -487,7 +487,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.jkneen.openclicky.widgets;
+				PRODUCT_BUNDLE_IDENTIFIER = com.itsnisargthakkar.openclicky.widgets;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = macosx;
@@ -512,7 +512,7 @@
 				CURRENT_PROJECT_VERSION = 6;
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				DEVELOPMENT_TEAM = SW75ZJJ5R6;
+				DEVELOPMENT_TEAM = UPL3NFSPL2;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
@@ -524,7 +524,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.jkneen.openclicky.widgets;
+				PRODUCT_BUNDLE_IDENTIFIER = com.itsnisargthakkar.openclicky.widgets;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				REGISTER_APP_GROUPS = YES;
 				SDKROOT = macosx;
@@ -672,7 +672,7 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 6;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = SW75ZJJ5R6;
+				DEVELOPMENT_TEAM = UPL3NFSPL2;
 				DRIVERKIT_DEPLOYMENT_TARGET = 25.0;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -685,8 +685,11 @@
 				INFOPLIST_KEY_CFBundleDisplayName = OpenClicky;
 				INFOPLIST_KEY_CFBundleName = OpenClicky;
 				INFOPLIST_KEY_NSAppleEventsUsageDescription = "OpenClicky uses Apple Events only when you ask it to automate local apps or System Events for guarded macOS control.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "OpenClicky uses the selected camera only when you enable visual intelligence or meeting notes, so it can understand camera images and visible text.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Jason Kneen. All rights reserved.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "OpenClicky uses the microphone for push-to-talk voice input, optional “Hey Clicky” wake-word listening, and optional meeting notes transcription.";
 				INFOPLIST_KEY_NSScreenCaptureUsageDescription = "OpenClicky needs screen recording access to see your screen and help you.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "OpenClicky uses on-device speech recognition to detect the optional “Hey Clicky” wake phrase when hands-free listening is enabled.";
 				INFOPLIST_KEY_NSUserNotificationAlertStyle = alert;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -695,7 +698,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.jkneen.openclicky;
+				PRODUCT_BUNDLE_IDENTIFIER = com.itsnisargthakkar.openclicky;
 				PRODUCT_MODULE_NAME = OpenClicky;
 				PRODUCT_NAME = OpenClicky;
 				REGISTER_APP_GROUPS = YES;
@@ -718,7 +721,7 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 6;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = SW75ZJJ5R6;
+				DEVELOPMENT_TEAM = UPL3NFSPL2;
 				DRIVERKIT_DEPLOYMENT_TARGET = 25.0;
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
@@ -731,8 +734,11 @@
 				INFOPLIST_KEY_CFBundleDisplayName = OpenClicky;
 				INFOPLIST_KEY_CFBundleName = OpenClicky;
 				INFOPLIST_KEY_NSAppleEventsUsageDescription = "OpenClicky uses Apple Events only when you ask it to automate local apps or System Events for guarded macOS control.";
+				INFOPLIST_KEY_NSCameraUsageDescription = "OpenClicky uses the selected camera only when you enable visual intelligence or meeting notes, so it can understand camera images and visible text.";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Jason Kneen. All rights reserved.";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "OpenClicky uses the microphone for push-to-talk voice input, optional “Hey Clicky” wake-word listening, and optional meeting notes transcription.";
 				INFOPLIST_KEY_NSScreenCaptureUsageDescription = "OpenClicky needs screen recording access to see your screen and help you.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "OpenClicky uses on-device speech recognition to detect the optional “Hey Clicky” wake phrase when hands-free listening is enabled.";
 				INFOPLIST_KEY_NSUserNotificationAlertStyle = alert;
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -741,7 +747,7 @@
 				);
 				MACOSX_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.jkneen.openclicky;
+				PRODUCT_BUNDLE_IDENTIFIER = com.itsnisargthakkar.openclicky;
 				PRODUCT_MODULE_NAME = OpenClicky;
 				PRODUCT_NAME = OpenClicky;
 				REGISTER_APP_GROUPS = YES;
