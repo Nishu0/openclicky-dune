@@ -598,6 +598,11 @@ final class CompanionManager: ObservableObject {
         return ClaudeAgentSDKAPI(model: modelOption.id, maxOutputTokens: modelOption.maxOutputTokens)
     }()
 
+    private lazy var localLLMAPI: LocalLLMAPI = {
+        let modelOption = OpenClickyModelCatalog.voiceResponseModel(withID: selectedModel)
+        return LocalLLMAPI(model: modelOption.id, maxOutputTokens: modelOption.maxOutputTokens)
+    }()
+
     private lazy var codexVoiceSession: CodexVoiceSession = {
         let modelOption = OpenClickyModelCatalog.codexVoiceSessionModel(withID: selectedModel)
         return CodexVoiceSession(model: modelOption.id, homeManager: codexHomeManager)
@@ -713,6 +718,11 @@ final class CompanionManager: ObservableObject {
         )
     }()
 
+    private lazy var systemSpeechTTSClient: SystemSpeechTTSClient = {
+        // Empty voiceID => macOS system default voice. Fully on-device.
+        return SystemSpeechTTSClient(voiceID: "")
+    }()
+
     private lazy var openAIRealtimeSpeechClient: OpenAIRealtimeSpeechClient = {
         return OpenAIRealtimeSpeechClient(
             apiKey: AppBundleConfiguration.openAIAPIKey(),
@@ -763,6 +773,7 @@ final class CompanionManager: ObservableObject {
         case .cartesia:   return cartesiaTTSClient
         case .deepgram:   return activeDeepgramTTSClient
         case .microsoftEdge: return microsoftEdgeTTSClient
+        case .system:     return systemSpeechTTSClient
         }
     }
 
@@ -776,6 +787,7 @@ final class CompanionManager: ObservableObject {
         case .cartesia:   return "CartesiaTTSClient"
         case .deepgram:   return "DeepgramTTSClient"
         case .microsoftEdge: return "MicrosoftEdgeTTSClient"
+        case .system:     return "SystemSpeechTTSClient"
         }
     }
 
@@ -786,6 +798,7 @@ final class CompanionManager: ObservableObject {
         case .cartesia:   return "CartesiaTTSClient.speakText"
         case .deepgram:   return "DeepgramTTSClient.speakText"
         case .microsoftEdge: return "MicrosoftEdgeTTSClient.speakText"
+        case .system:     return "SystemSpeechTTSClient.speakText"
         }
     }
 
@@ -796,6 +809,7 @@ final class CompanionManager: ObservableObject {
         case .cartesia:   return "CartesiaTTSClient.beginStreamingResponse"
         case .deepgram:   return "DeepgramTTSClient.beginStreamingResponse"
         case .microsoftEdge: return "MicrosoftEdgeTTSClient.beginStreamingResponse"
+        case .system:     return "SystemSpeechTTSClient.beginStreamingResponse"
         }
     }
 
@@ -1681,7 +1695,10 @@ final class CompanionManager: ObservableObject {
         }
 
         if selectedTTSProvider == .openAIRealtime {
-            setTTSProvider(.cartesia)
+            // Leaving a Realtime model needs a separate playback engine.
+            // Default to the keyless on-device voice so a no-key/local setup
+            // (e.g. the local Gemma model) can speak without configuration.
+            setTTSProvider(.system)
         }
 
         applyVoiceResponseModelSettings(selectedVoiceResponseModel)
@@ -1695,6 +1712,8 @@ final class CompanionManager: ObservableObject {
             }
         case .deepgram:
             deepgramVoiceAgentClient.warmUpConnection()
+        case .local:
+            localLLMAPI.warmUp()
         }
     }
 
@@ -1728,6 +1747,9 @@ final class CompanionManager: ObservableObject {
                 voiceID: AppBundleConfiguration.deepgramTTSVoice(),
                 thinkModel: AppBundleConfiguration.deepgramVoiceAgentThinkModel()
             )
+        case .local:
+            localLLMAPI.model = modelOption.id
+            localLLMAPI.maxOutputTokens = modelOption.maxOutputTokens
         }
     }
 
@@ -2163,6 +2185,8 @@ final class CompanionManager: ObservableObject {
             if selectedVoiceResponseModel.provider == .codex || AppBundleConfiguration.openAIAPIKey() == nil {
                 codexVoiceSession.warmUp(systemPrompt: currentVoiceResponseSystemPrompt())
             }
+        case .local:
+            localLLMAPI.warmUp()
         }
         // Force-init the active TTS provider and prime its TLS
         // handshake. The first sentence's TTS request would otherwise
@@ -3984,6 +4008,12 @@ final class CompanionManager: ObservableObject {
             fields["transport"] = "codex_app_server_stdio"
             fields["streamingMethod"] = "codex_app_server_agentMessage_delta"
             fields["apiKeyFallback"] = AppBundleConfiguration.openAIAPIKey() != nil
+        case .local:
+            fields["executionMethod"] = "LocalLLMAPI.analyzeImageStreaming"
+            fields["authMode"] = "local_ollama_no_key"
+            fields["transport"] = "ollama_native_chat_ndjson"
+            fields["streamingMethod"] = "URLSession.bytes + message.content delta"
+            fields["apiKeyFallback"] = false
         }
 
         return fields
@@ -15984,7 +16014,40 @@ final class CompanionManager: ObservableObject {
                 userPrompt: userPrompt,
                 onTextChunk: onTextChunk
             )
+        case .local:
+            return try await analyzeLocalVoiceResponse(
+                images: images,
+                model: selectedVoiceResponseModel.id,
+                systemPrompt: systemPrompt,
+                conversationHistory: conversationHistory,
+                userPrompt: userPrompt,
+                onTextChunk: onTextChunk
+            )
         }
+    }
+
+    private func analyzeLocalVoiceResponse(
+        images: [(data: Data, label: String)],
+        model: String,
+        systemPrompt: String,
+        conversationHistory: [(userPlaceholder: String, assistantResponse: String)] = [],
+        userPrompt: String,
+        onTextChunk: @MainActor @Sendable @escaping (String) -> Void
+    ) async throws -> String {
+        // Fully local: no API key path, no fallback to a paid provider.
+        // If the local server is down the thrown error surfaces to the user.
+        let modelOption = OpenClickyModelCatalog.voiceResponseModel(withID: model)
+        localLLMAPI.model = modelOption.id
+        localLLMAPI.maxOutputTokens = modelOption.maxOutputTokens
+        print("🧠 analyzeLocalVoiceResponse: using local Ollama model \(modelOption.id)")
+        let (text, _) = try await localLLMAPI.analyzeImageStreaming(
+            images: images,
+            systemPrompt: systemPrompt,
+            conversationHistory: conversationHistory,
+            userPrompt: userPrompt,
+            onTextChunk: onTextChunk
+        )
+        return text
     }
 
     private func analyzeClaudeResponse(
@@ -16178,6 +16241,9 @@ final class CompanionManager: ObservableObject {
         switch ttsProvider {
         case .cartesia, .elevenLabs, .microsoftEdge, .deepgram:
             return wordCount >= 6
+        case .system:
+            // The on-device voice speaks directly (no pre-baked PCM fillers).
+            return false
         case .openAIRealtime:
             return false
         }
@@ -16458,6 +16524,9 @@ final class CompanionManager: ObservableObject {
             return .openAIResponses
         case .deepgram:
             return .unsupported
+        case .local:
+            // Local pointing is not wired yet (vision scope); fall through.
+            return .unsupported
         }
     }
 
@@ -16500,7 +16569,7 @@ final class CompanionManager: ObservableObject {
                 displayWidthInPoints: targetScreenCapture.displayWidthInPoints,
                 displayHeightInPoints: targetScreenCapture.displayHeightInPoints
             )
-        case .openAI, .deepgram:
+        case .openAI, .deepgram, .local:
             return
         }
 
