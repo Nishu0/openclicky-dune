@@ -3790,6 +3790,8 @@ nonisolated enum OpenClickyTTSProvider: String, CaseIterable, Identifiable {
     case cartesia = "cartesia"
     case deepgram = "deepgram"
     case microsoftEdge = "microsoft_edge"
+    /// Fully on-device macOS speech (AVSpeechSynthesizer). No key, no network.
+    case system = "system"
     var id: String { rawValue }
     var displayName: String {
         switch self {
@@ -3798,6 +3800,7 @@ nonisolated enum OpenClickyTTSProvider: String, CaseIterable, Identifiable {
         case .cartesia: return "Cartesia"
         case .deepgram: return "Deepgram Aura"
         case .microsoftEdge: return "Microsoft Edge"
+        case .system: return "macOS Voice (Local)"
         }
     }
     static func resolve(_ raw: String?) -> OpenClickyTTSProvider {
@@ -4293,3 +4296,169 @@ final class DeepgramTTSClient {
 }
 
 extension DeepgramTTSClient: OpenClickyTTSClient {}
+
+// MARK: - SystemSpeechTTSClient
+
+/// Fully on-device text-to-speech using macOS `AVSpeechSynthesizer`.
+/// No API key, no network.
+///
+/// Speaks directly via `AVSpeechSynthesizer.speak()` rather than rendering
+/// PCM into an `AVAudioEngine`: the offline `write(_:toBufferCallback:)`
+/// render conflicts with a running playback engine (HAL overload / multi-
+/// second stalls), so we let the synthesizer own its own audio output.
+/// `fetchSentenceSamples` returns empty (the streaming session's PCM path is
+/// unused; speech happens inside the fetch closure), so pre-baked fillers are
+/// effectively disabled for this provider.
+///
+/// `voiceID` optionally selects a system voice by its
+/// `AVSpeechSynthesisVoice` identifier or a language code (e.g. "en-US");
+/// empty uses the system default voice.
+@MainActor
+final class SystemSpeechTTSClient: NSObject, OpenClickyTTSClient, AVSpeechSynthesizerDelegate {
+    private(set) var voiceID: String
+    private let synthesizer = AVSpeechSynthesizer()
+
+    /// Per-utterance completion continuations, keyed by utterance identity.
+    private var finishContinuations: [ObjectIdentifier: CheckedContinuation<Void, Never>] = [:]
+    /// Serial chain so sentences are spoken strictly in order without overlap.
+    private var speechTail: Task<Void, Never> = Task {}
+    /// Fired once when speech actually begins (drives the "speaking" overlay).
+    private var pendingPlaybackStarted: (@MainActor () -> Void)?
+
+    /// Kept only so `StreamingTTSSession` has a non-nil `playerNode` (it drops
+    /// sentences otherwise). No audio is ever scheduled on it.
+    private var audioEngine: AVAudioEngine?
+    private var playerNode: AVAudioPlayerNode?
+    private weak var activeStreamingSession: StreamingTTSSession?
+
+    init(voiceID: String) {
+        self.voiceID = voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        super.init()
+        synthesizer.delegate = self
+    }
+
+    func updateConfiguration(apiKey: String?, voiceID: String) {
+        self.voiceID = voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // On-device synthesis has no connection to warm.
+    func warmUpConnection() {}
+
+    var isPlaying: Bool { synthesizer.isSpeaking }
+
+    func stopPlayback() {
+        activeStreamingSession?.cancel()
+        activeStreamingSession = nil
+        synthesizer.stopSpeaking(at: .immediate)
+        // Resume any awaiting speak() continuations so chained tasks unwind.
+        // Remove first so the resulting didCancel delegate callbacks are no-ops.
+        let pending = finishContinuations
+        finishContinuations.removeAll()
+        pending.values.forEach { $0.resume() }
+        pendingPlaybackStarted = nil
+        if let playerNode { ElevenLabsTTSClient.stopPlayerIfAttached(playerNode) }
+        playerNode = nil
+        audioEngine?.stop()
+        audioEngine = nil
+    }
+
+    func speakText(
+        _ text: String,
+        waitUntilFinished: Bool = true,
+        onPlaybackStarted: (() -> Void)? = nil
+    ) async throws {
+        pendingPlaybackStarted = { onPlaybackStarted?() }
+        if waitUntilFinished {
+            await speakSerialized(text)
+        } else {
+            Task { [weak self] in await self?.speakSerialized(text) }
+        }
+    }
+
+    func beginStreamingResponse(onPlaybackStarted: @escaping @MainActor () -> Void) -> StreamingTTSSession {
+        synthesizer.stopSpeaking(at: .immediate)
+        pendingPlaybackStarted = onPlaybackStarted
+
+        // A minimal (unstarted) engine/player so the session keeps sentences;
+        // playback is via AVSpeechSynthesizer.speak(), not this node.
+        let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        let streamFormat = AVAudioFormat(
+            commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false
+        )
+        if let streamFormat {
+            engine.attach(player)
+            engine.connect(player, to: engine.mainMixerNode, format: streamFormat)
+        }
+        self.audioEngine = engine
+        self.playerNode = player
+
+        let session = StreamingTTSSession(
+            fetchSamples: { [weak self] text in
+                guard let self else { throw CancellationError() }
+                await self.speakSerialized(text)
+                return [] // Speech already played; nothing to schedule.
+            },
+            playerNode: player,
+            format: streamFormat,
+            sampleRate: 24_000,
+            onPlaybackStarted: onPlaybackStarted
+        )
+        self.activeStreamingSession = session
+        return session
+    }
+
+    /// Unused PCM path — speech happens via `speak()`. Returning empty also
+    /// disables pre-baked fillers (the library builder treats empty as none).
+    func fetchSentenceSamples(_ text: String) async throws -> [Int16] { [] }
+
+    /// Speaks `text` after all previously-queued sentences finish, preserving
+    /// order without overlap.
+    private func speakSerialized(_ text: String) async {
+        let predecessor = speechTail
+        let task = Task { @MainActor [weak self] in
+            _ = await predecessor.value
+            await self?.speakOne(text)
+        }
+        speechTail = task
+        await task.value
+    }
+
+    private func speakOne(_ text: String) async {
+        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return }
+        let utterance = AVSpeechUtterance(string: cleaned)
+        if let voice = Self.resolveVoice(voiceID) { utterance.voice = voice }
+        utterance.volume = Float(AppBundleConfiguration.voicePlaybackVolume())
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            finishContinuations[ObjectIdentifier(utterance)] = continuation
+            synthesizer.speak(utterance)
+        }
+    }
+
+    private func resumeContinuation(for utterance: AVSpeechUtterance) {
+        finishContinuations.removeValue(forKey: ObjectIdentifier(utterance))?.resume()
+    }
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in
+            self?.pendingPlaybackStarted?()
+            self?.pendingPlaybackStarted = nil
+        }
+    }
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in self?.resumeContinuation(for: utterance) }
+    }
+
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in self?.resumeContinuation(for: utterance) }
+    }
+
+    nonisolated private static func resolveVoice(_ identifier: String) -> AVSpeechSynthesisVoice? {
+        let trimmed = identifier.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil } // nil => system default voice
+        if let byIdentifier = AVSpeechSynthesisVoice(identifier: trimmed) { return byIdentifier }
+        return AVSpeechSynthesisVoice(language: trimmed)
+    }
+}
