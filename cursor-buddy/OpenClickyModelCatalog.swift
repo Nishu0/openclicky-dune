@@ -5,6 +5,8 @@ nonisolated enum OpenClickyModelProvider: String, Equatable {
     case openAI
     case codex
     case deepgram
+    /// A local, on-device model served by Ollama. No API key, no egress.
+    case local
 
     var displayName: String {
         switch self {
@@ -16,6 +18,8 @@ nonisolated enum OpenClickyModelProvider: String, Equatable {
             return "Codex"
         case .deepgram:
             return "Deepgram"
+        case .local:
+            return "Local"
         }
     }
 }
@@ -68,7 +72,10 @@ nonisolated enum OpenClickyModelCatalog {
         OpenClickyModelOption(id: "gpt-5.5", label: "GPT-5.5", provider: .openAI, maxOutputTokens: 128_000),
         OpenClickyModelOption(id: "gpt-5.4", label: "GPT-5.4", provider: .openAI, maxOutputTokens: 128_000),
         OpenClickyModelOption(id: "gpt-5.4-mini", label: "GPT-5.4 Mini", provider: .openAI, maxOutputTokens: 128_000),
-        OpenClickyModelOption(id: "gpt-5.2", label: "GPT-5.2", provider: .openAI, maxOutputTokens: 128_000)
+        OpenClickyModelOption(id: "gpt-5.2", label: "GPT-5.2", provider: .openAI, maxOutputTokens: 128_000),
+        // Fully local, on-device via Ollama. The id IS the Ollama model
+        // reference, passed straight through to the local server.
+        OpenClickyModelOption(id: "hf.co/unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL", label: "Gemma 4 12B (Local)", provider: .local, maxOutputTokens: 8_192)
     ]
 
     static let speechModels: [OpenClickyModelOption] = [
