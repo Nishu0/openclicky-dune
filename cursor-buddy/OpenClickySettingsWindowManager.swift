@@ -903,6 +903,11 @@ struct OpenClickySettingsView: View {
                             set: { userMicrosoftEdgeVoiceID = $0; companionManager.setMicrosoftEdgeVoiceID($0) }
                         )
                     )
+                case .system:
+                    Text("macOS Voice speaks OpenClicky's reply fully on-device using the system speech voices — no API key and no network. Choose or download voices in System Settings → Accessibility → Spoken Content → System Voice.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
                 }
             }
         }
