@@ -16,6 +16,7 @@ nonisolated enum AppBundleConfiguration {
     static let userCartesiaVoiceIDDefaultsKey = "openClickyCartesiaVoiceID"
     static let userOpenAIRealtimeVoiceIDDefaultsKey = "openClickyOpenAIRealtimeVoiceID"
     static let userMicrosoftEdgeVoiceIDDefaultsKey = "openClickyMicrosoftEdgeVoiceID"
+    static let userKokoroVoiceIDDefaultsKey = "openClickyKokoroVoiceID"
     /// Deepgram TTS reuses the existing Deepgram STT API key
     /// (`userDeepgramAPIKeyDefaultsKey`). Only the voice/model is
     /// TTS-specific.
@@ -53,6 +54,8 @@ nonisolated enum AppBundleConfiguration {
     static let userVisualDrawingOverlayToolsEnabledDefaultsKey = "openClickyVisualDrawingOverlayToolsEnabled"
     static let userExternalControlBridgeTokenDefaultsKey = "openClickyExternalControlBridgeToken"
     static let userAgentPlaintextProviderSyncEnabledDefaultsKey = "openClickyAgentPlaintextProviderSyncEnabled"
+    static let userAutoResumeAgentTasksOnLaunchDefaultsKey = "openClickyAutoResumeAgentTasksOnLaunch"
+    static let userLocalOnlyModeDefaultsKey = "openClickyLocalOnlyMode"
     static let userDesktopNotificationsEnabledDefaultsKey = "openClickyDesktopNotificationsEnabled"
     static let userWidgetsEnabledDefaultsKey = "openClickyWidgetsEnabled"
     static let userWidgetsIncludeAgentTaskNamesDefaultsKey = "openClickyWidgetsIncludeAgentTaskNames"
@@ -152,6 +155,27 @@ nonisolated enum AppBundleConfiguration {
 
     static func agentPlaintextProviderSyncEnabled() -> Bool {
         userDefaultsBool(forKey: userAgentPlaintextProviderSyncEnabledDefaultsKey, defaultValue: false)
+    }
+
+    /// When ON (default), OpenClicky stays fully on-device: voice requests are
+    /// never auto-routed to the cloud Codex Agent Mode (which uses the internet,
+    /// web search, and your OpenAI/ChatGPT sign-in). Everything is answered by the
+    /// local model (Gemma via Ollama) and spoken by the local voice (Kokoro / macOS).
+    /// Turn OFF to allow voice requests like "latest news" to spin up a cloud agent.
+    /// Env override: set OPENCLICKY_LOCAL_ONLY=0 to force-disable.
+    static func localOnlyModeEnabled() -> Bool {
+        let environmentValue = normalizedConfigurationValue(ProcessInfo.processInfo.environment["OPENCLICKY_LOCAL_ONLY"])
+        if environmentValue == "0" || environmentValue?.lowercased() == "false" { return false }
+        if environmentValue == "1" || environmentValue?.lowercased() == "true" { return true }
+        return userDefaultsBool(forKey: userLocalOnlyModeDefaultsKey, defaultValue: true)
+    }
+
+    /// When OFF (default), interrupted Agent Mode tasks from a previous run are
+    /// still restored into the dashboard but are NOT auto-resumed on launch, so
+    /// the app no longer fires a "resume/summarize this task" LLM prompt for every
+    /// past task each time it starts. Opt in to restore the old auto-resume.
+    static func autoResumeAgentTasksOnLaunchEnabled() -> Bool {
+        userDefaultsBool(forKey: userAutoResumeAgentTasksOnLaunchDefaultsKey, defaultValue: false)
     }
 
     static func assemblyAIAPIKey() -> String? {
@@ -264,6 +288,15 @@ nonisolated enum AppBundleConfiguration {
         ) ?? localDevelopmentEnvironmentValue(forKey: "MICROSOFT_EDGE_VOICE_ID")
             ?? localDevelopmentEnvironmentValue(forKey: "EDGE_TTS_VOICE")
         ?? "en-US-EmmaMultilingualNeural"
+    }
+
+    /// Kokoro (local neural TTS) voice name, e.g. "af_heart", "af_bella".
+    /// Served by a local Kokoro server; no API key.
+    static func kokoroVoiceID() -> String {
+        userDefaultsValue(forKey: userKokoroVoiceIDDefaultsKey) ?? stringValue(
+            forKey: "KokoroVoiceID",
+            environmentKeys: ["KOKORO_VOICE_ID"]
+        ) ?? "af_heart"
     }
 
     private static func userDefaultsBool(forKey key: String, defaultValue: Bool) -> Bool {
