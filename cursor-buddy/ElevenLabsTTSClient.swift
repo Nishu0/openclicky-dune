@@ -20,6 +20,7 @@
 import AVFoundation
 import CryptoKit
 import Foundation
+import NaturalLanguage
 
 @MainActor
 final class ElevenLabsTTSClient {
@@ -3792,6 +3793,8 @@ nonisolated enum OpenClickyTTSProvider: String, CaseIterable, Identifiable {
     case microsoftEdge = "microsoft_edge"
     /// Fully on-device macOS speech (AVSpeechSynthesizer). No key, no network.
     case system = "system"
+    /// Local neural TTS via a Kokoro server (OpenAI-compatible). No key.
+    case kokoro = "kokoro"
     var id: String { rawValue }
     var displayName: String {
         switch self {
@@ -3801,6 +3804,7 @@ nonisolated enum OpenClickyTTSProvider: String, CaseIterable, Identifiable {
         case .deepgram: return "Deepgram Aura"
         case .microsoftEdge: return "Microsoft Edge"
         case .system: return "macOS Voice (Local)"
+        case .kokoro: return "Kokoro (Local Neural)"
         }
     }
     static func resolve(_ raw: String?) -> OpenClickyTTSProvider {
@@ -4428,7 +4432,18 @@ final class SystemSpeechTTSClient: NSObject, OpenClickyTTSClient, AVSpeechSynthe
         let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { return }
         let utterance = AVSpeechUtterance(string: cleaned)
-        if let voice = Self.resolveVoice(voiceID) { utterance.voice = voice }
+        let configuredVoice = Self.resolveVoice(voiceID)
+        // Speak each sentence in its own language (e.g. Hindi -> the macOS
+        // "Lekha" hi-IN voice) when it differs from the configured voice;
+        // English/unknown keeps the configured voice. Fully on-device.
+        if let languageVoice = OpenClickyTTSLanguageRouter.appleVoice(
+            for: cleaned,
+            configuredVoiceLanguage: configuredVoice?.language
+        ) {
+            utterance.voice = languageVoice
+        } else if let configuredVoice {
+            utterance.voice = configuredVoice
+        }
         utterance.volume = Float(AppBundleConfiguration.voicePlaybackVolume())
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             finishContinuations[ObjectIdentifier(utterance)] = continuation
@@ -4460,5 +4475,342 @@ final class SystemSpeechTTSClient: NSObject, OpenClickyTTSClient, AVSpeechSynthe
         guard !trimmed.isEmpty else { return nil } // nil => system default voice
         if let byIdentifier = AVSpeechSynthesisVoice(identifier: trimmed) { return byIdentifier }
         return AVSpeechSynthesisVoice(language: trimmed)
+    }
+}
+
+// MARK: - KokoroTTSClient
+
+/// Local neural text-to-speech via a Kokoro server (e.g. Kokoro-FastAPI)
+/// exposing the OpenAI-compatible `POST /v1/audio/speech` endpoint. No API
+/// key, no cloud — inference runs on the user's machine. Requests raw 16-bit
+/// PCM at 24 kHz and feeds the same `StreamingTTSSession` pipeline as the
+/// other PCM providers, so streaming/ordering/volume behave identically.
+///
+/// Override the server with the `KOKORO_BASE_URL` launch environment variable
+/// (defaults to the standard local port). `voiceID` is a Kokoro voice name
+/// such as `af_heart`, `af_bella`, or `bf_emma`.
+@MainActor
+final class KokoroTTSClient: OpenClickyTTSClient {
+    nonisolated static let streamSampleRate: Double = 24_000
+    private nonisolated static let defaultVoiceID = "af_heart"
+
+    private(set) var voiceID: String
+    private let baseURL: URL
+    private let session: URLSession
+    private var audioEngine: AVAudioEngine?
+    private var playerNode: AVAudioPlayerNode?
+    private var streamingTask: Task<Void, Error>?
+    private weak var activeStreamingSession: StreamingTTSSession?
+
+    init(voiceID: String) {
+        self.voiceID = voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if self.voiceID.isEmpty { self.voiceID = Self.defaultVoiceID }
+
+        let configuredBaseURL = ProcessInfo.processInfo.environment["KOKORO_BASE_URL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        self.baseURL = URL(string: (configuredBaseURL?.isEmpty == false ? configuredBaseURL! : "http://127.0.0.1:8880"))
+            ?? URL(string: "http://127.0.0.1:8880")!
+
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 60
+        configuration.timeoutIntervalForResource = 120
+        configuration.httpMaximumConnectionsPerHost = 6
+        self.session = URLSession(configuration: configuration)
+    }
+
+    func updateConfiguration(apiKey: String?, voiceID: String) {
+        let trimmed = voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.voiceID = trimmed.isEmpty ? Self.defaultVoiceID : trimmed
+    }
+
+    func warmUpConnection() {
+        var request = URLRequest(url: baseURL.appendingPathComponent("health"))
+        request.httpMethod = "GET"
+        request.timeoutInterval = 5
+        session.dataTask(with: request) { _, _, _ in }.resume()
+    }
+
+    var isPlaying: Bool {
+        guard let playerNode, playerNode.engine != nil else { return false }
+        return playerNode.isPlaying
+    }
+
+    func stopPlayback() {
+        activeStreamingSession?.cancel()
+        activeStreamingSession = nil
+        stopPlaybackInternal()
+    }
+
+    private func stopPlaybackInternal() {
+        streamingTask?.cancel()
+        streamingTask = nil
+        if let playerNode {
+            ElevenLabsTTSClient.stopPlayerIfAttached(playerNode)
+        }
+        playerNode = nil
+        audioEngine?.stop()
+        audioEngine = nil
+    }
+
+    func speakText(
+        _ text: String,
+        waitUntilFinished: Bool = true,
+        onPlaybackStarted: (() -> Void)? = nil
+    ) async throws {
+        stopPlaybackInternal()
+        let samples = try await fetchSentenceSamples(text)
+
+        let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        guard let streamFormat = Self.makeStreamFormat() else {
+            throw Self.makeError(-202, "Could not build Kokoro PCM stream format")
+        }
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: streamFormat)
+        do { try engine.start() } catch {
+            throw Self.makeError(-203, "Audio engine failed to start: \(error.localizedDescription)")
+        }
+        self.audioEngine = engine
+        self.playerNode = player
+
+        let playerRef = player
+        let engineRef = engine
+        let scheduledFrames = ElevenLabsTTSClient.scheduleSamples(samples, on: playerRef, format: streamFormat)
+        if scheduledFrames > 0 { onPlaybackStarted?() }
+
+        let task = Task<Void, Error> { [weak self] in
+            await ElevenLabsTTSClient.waitForPlaybackToDrain(
+                playerRef,
+                scheduledFrameCount: scheduledFrames,
+                sampleRate: Self.streamSampleRate
+            )
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                if self.audioEngine === engineRef {
+                    self.audioEngine?.stop()
+                    self.audioEngine = nil
+                    self.playerNode = nil
+                }
+            }
+        }
+        self.streamingTask = task
+        if waitUntilFinished {
+            do { try await task.value }
+            catch is CancellationError { stopPlaybackInternal(); throw CancellationError() }
+            catch { stopPlaybackInternal(); throw error }
+        }
+    }
+
+    func beginStreamingResponse(onPlaybackStarted: @escaping @MainActor () -> Void) -> StreamingTTSSession {
+        stopPlaybackInternal()
+        let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        guard let streamFormat = Self.makeStreamFormat() else {
+            return StreamingTTSSession(
+                fetchSamples: { [weak self] text in
+                    guard let self else { throw CancellationError() }
+                    return try await self.fetchSentenceSamples(text)
+                },
+                playerNode: nil,
+                format: nil,
+                sampleRate: Self.streamSampleRate,
+                onPlaybackStarted: onPlaybackStarted
+            )
+        }
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: streamFormat)
+        do { try engine.start() } catch {
+            print("⚠️ AVAudioEngine failed to start Kokoro streaming session: \(error)")
+            return StreamingTTSSession(
+                fetchSamples: { [weak self] text in
+                    guard let self else { throw CancellationError() }
+                    return try await self.fetchSentenceSamples(text)
+                },
+                playerNode: nil,
+                format: nil,
+                sampleRate: Self.streamSampleRate,
+                onPlaybackStarted: onPlaybackStarted
+            )
+        }
+        self.audioEngine = engine
+        self.playerNode = player
+        let streaming = StreamingTTSSession(
+            fetchSamples: { [weak self] text in
+                guard let self else { throw CancellationError() }
+                return try await self.fetchSentenceSamples(text)
+            },
+            playerNode: player,
+            format: streamFormat,
+            sampleRate: Self.streamSampleRate,
+            onPlaybackStarted: onPlaybackStarted
+        )
+        self.activeStreamingSession = streaming
+        return streaming
+    }
+
+    func fetchSentenceSamples(_ text: String) async throws -> [Int16] {
+        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return [] }
+        // Pick a voice in the sentence's language (e.g. Hindi -> hf_alpha) so a
+        // non-English local reply is spoken correctly; English keeps the
+        // user's configured voice. Fully on-device.
+        let voiceForText = OpenClickyTTSLanguageRouter.kokoroVoice(for: cleaned, configuredVoice: voiceID)
+        let pcmData = try await Self.fetchPCMData(
+            text: cleaned,
+            voiceID: voiceForText,
+            baseURL: baseURL,
+            session: session
+        )
+        return Self.decodePCM16(pcmData)
+    }
+
+    private static func makeStreamFormat() -> AVAudioFormat? {
+        AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: streamSampleRate,
+            channels: 1,
+            interleaved: false
+        )
+    }
+
+    nonisolated private static func fetchPCMData(
+        text: String,
+        voiceID: String,
+        baseURL: URL,
+        session: URLSession
+    ) async throws -> Data {
+        var request = URLRequest(url: baseURL.appendingPathComponent("v1/audio/speech"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: Any] = [
+            "model": "kokoro",
+            "voice": voiceID,
+            "input": text,
+            // Raw 16-bit PCM @ 24 kHz mono — feeds the pipeline directly.
+            "response_format": "pcm",
+            "speed": 1.0
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw makeError(-210, "Kokoro server returned an unexpected response.")
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw makeError(-211, "Kokoro server error (HTTP \(httpResponse.statusCode)). Is the Kokoro server running at \(baseURL.absoluteString)?")
+        }
+        guard !data.isEmpty else {
+            throw makeError(-212, "Kokoro returned no audio.")
+        }
+        return data
+    }
+
+    /// Interprets raw little-endian 16-bit PCM bytes as `[Int16]`. Uses
+    /// `copyBytes` so it tolerates unaligned buffers.
+    nonisolated private static func decodePCM16(_ data: Data) -> [Int16] {
+        let sampleCount = data.count / 2
+        guard sampleCount > 0 else { return [] }
+        var samples = [Int16](repeating: 0, count: sampleCount)
+        _ = samples.withUnsafeMutableBytes { destination in
+            data.copyBytes(to: destination, count: sampleCount * 2)
+        }
+        return samples
+    }
+
+    nonisolated private static func makeError(_ code: Int, _ message: String) -> NSError {
+        NSError(domain: "KokoroTTSClient", code: code, userInfo: [NSLocalizedDescriptionKey: message])
+    }
+}
+
+// MARK: - OpenClickyTTSLanguageRouter
+
+/// On-device language routing for the local TTS providers. Detects the
+/// dominant language of the text about to be spoken using Apple's
+/// `NaturalLanguage` framework (no network, no API key) and maps it to a voice
+/// in that language. This lets a Hindi (or other non-English) reply from the
+/// local Gemma model be spoken by a matching voice instead of an English voice
+/// mangling the script — fully local, automatic, per sentence.
+///
+/// English and unrecognized text keep the user's configured voice, so the
+/// normal experience is unchanged; only a confidently-detected foreign-language
+/// sentence switches the voice, and it switches back on the next English one.
+enum OpenClickyTTSLanguageRouter {
+    /// Minimum letters before we trust detection — guards against a stray short
+    /// token ("ok", "hmm") flipping the voice.
+    private static let minimumLetterCount = 4
+    /// Minimum confidence from the recognizer to act on a detected language.
+    private static let minimumConfidence = 0.65
+
+    /// Dominant language of `text`, or nil when too short / low-confidence.
+    static func dominantLanguage(of text: String) -> NLLanguage? {
+        let letters = text.unicodeScalars.filter { CharacterSet.letters.contains($0) }
+        guard letters.count >= minimumLetterCount else { return nil }
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(text)
+        guard let (language, confidence) = recognizer.languageHypotheses(withMaximum: 1).first,
+              confidence >= minimumConfidence else { return nil }
+        return language
+    }
+
+    // MARK: Kokoro
+
+    /// Kokoro voice prefix letter encodes language (a/b English, h Hindi,
+    /// e Spanish, f French, i Italian, j Japanese, p Portuguese, z Chinese).
+    /// All of these ship in the standard Kokoro v1.0 voice pack.
+    private static let kokoroVoiceByLanguage: [NLLanguage: String] = [
+        .hindi: "hf_alpha",
+        .spanish: "ef_dora",
+        .french: "ff_siwis",
+        .italian: "if_sara",
+        .japanese: "jf_alpha",
+        .portuguese: "pf_dora",
+        .simplifiedChinese: "zf_xiaoxiao",
+        .traditionalChinese: "zf_xiaoxiao"
+    ]
+
+    /// Voice to use for `text`. Keeps the user's configured voice for
+    /// English/unknown, or when it is already in the detected language;
+    /// otherwise switches to a matching-language voice.
+    static func kokoroVoice(for text: String, configuredVoice: String) -> String {
+        guard let language = dominantLanguage(of: text),
+              let mapped = kokoroVoiceByLanguage[language] else {
+            return configuredVoice
+        }
+        // Same language family (first letter) as the configured voice ->
+        // respect the user's specific pick.
+        if configuredVoice.first == mapped.first {
+            return configuredVoice
+        }
+        return mapped
+    }
+
+    // MARK: macOS AVSpeechSynthesizer
+
+    private static let appleLanguageCodeByLanguage: [NLLanguage: String] = [
+        .hindi: "hi-IN",
+        .spanish: "es-ES",
+        .french: "fr-FR",
+        .italian: "it-IT",
+        .japanese: "ja-JP",
+        .portuguese: "pt-BR",
+        .simplifiedChinese: "zh-CN",
+        .traditionalChinese: "zh-TW",
+        .german: "de-DE"
+    ]
+
+    /// A system voice for `text` when its language differs from the configured
+    /// voice's language and macOS has a voice installed for it; nil means
+    /// "keep the configured voice".
+    static func appleVoice(for text: String, configuredVoiceLanguage: String?) -> AVSpeechSynthesisVoice? {
+        guard let language = dominantLanguage(of: text),
+              let code = appleLanguageCodeByLanguage[language] else {
+            return nil
+        }
+        // Configured voice already speaks this language -> keep it.
+        if let configuredVoiceLanguage,
+           configuredVoiceLanguage.hasPrefix(String(code.prefix(2))) {
+            return nil
+        }
+        return AVSpeechSynthesisVoice(language: code)
     }
 }
