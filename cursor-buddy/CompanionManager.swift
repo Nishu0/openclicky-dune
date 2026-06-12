@@ -723,6 +723,10 @@ final class CompanionManager: ObservableObject {
         return SystemSpeechTTSClient(voiceID: "")
     }()
 
+    private lazy var kokoroTTSClient: KokoroTTSClient = {
+        return KokoroTTSClient(voiceID: AppBundleConfiguration.kokoroVoiceID())
+    }()
+
     private lazy var openAIRealtimeSpeechClient: OpenAIRealtimeSpeechClient = {
         return OpenAIRealtimeSpeechClient(
             apiKey: AppBundleConfiguration.openAIAPIKey(),
@@ -774,6 +778,7 @@ final class CompanionManager: ObservableObject {
         case .deepgram:   return activeDeepgramTTSClient
         case .microsoftEdge: return microsoftEdgeTTSClient
         case .system:     return systemSpeechTTSClient
+        case .kokoro:     return kokoroTTSClient
         }
     }
 
@@ -788,6 +793,7 @@ final class CompanionManager: ObservableObject {
         case .deepgram:   return "DeepgramTTSClient"
         case .microsoftEdge: return "MicrosoftEdgeTTSClient"
         case .system:     return "SystemSpeechTTSClient"
+        case .kokoro:     return "KokoroTTSClient"
         }
     }
 
@@ -799,6 +805,7 @@ final class CompanionManager: ObservableObject {
         case .deepgram:   return "DeepgramTTSClient.speakText"
         case .microsoftEdge: return "MicrosoftEdgeTTSClient.speakText"
         case .system:     return "SystemSpeechTTSClient.speakText"
+        case .kokoro:     return "KokoroTTSClient.speakText"
         }
     }
 
@@ -810,6 +817,7 @@ final class CompanionManager: ObservableObject {
         case .deepgram:   return "DeepgramTTSClient.beginStreamingResponse"
         case .microsoftEdge: return "MicrosoftEdgeTTSClient.beginStreamingResponse"
         case .system:     return "SystemSpeechTTSClient.beginStreamingResponse"
+        case .kokoro:     return "KokoroTTSClient.beginStreamingResponse"
         }
     }
 
@@ -842,6 +850,22 @@ final class CompanionManager: ObservableObject {
         )
         if selectedTTSProvider == .microsoftEdge {
             FillerPhraseLibrary.shared.prepare(client: microsoftEdgeTTSClient)
+        }
+    }
+
+    func setKokoroVoiceID(_ voiceID: String) {
+        let trimmed = voiceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            UserDefaults.standard.removeObject(forKey: AppBundleConfiguration.userKokoroVoiceIDDefaultsKey)
+        } else {
+            UserDefaults.standard.set(trimmed, forKey: AppBundleConfiguration.userKokoroVoiceIDDefaultsKey)
+        }
+        kokoroTTSClient.updateConfiguration(
+            apiKey: nil,
+            voiceID: AppBundleConfiguration.kokoroVoiceID()
+        )
+        if selectedTTSProvider == .kokoro {
+            FillerPhraseLibrary.shared.prepare(client: kokoroTTSClient)
         }
     }
 
@@ -3467,6 +3491,11 @@ final class CompanionManager: ObservableObject {
 
     private func resumeRestoredAgentTasksIfNeeded(trigger: String) {
         pendingRelaunchableAgentResumeTask = nil
+        // Off by default: restored interrupted tasks stay in the dashboard but are
+        // not auto-resumed, so launching the app no longer summarizes every past
+        // task. Re-enable via Settings → AI Providers → Agent tools →
+        // "Resume past tasks on launch".
+        guard AppBundleConfiguration.autoResumeAgentTasksOnLaunchEnabled() else { return }
         let sessionsToResume = codexAgentSessions.filter { session in
             session.canResumeAfterRelaunch
                 && !archivedSessionIDs.contains(session.id)
@@ -4945,6 +4974,12 @@ final class CompanionManager: ObservableObject {
         if startAgentTaskFromDeferredLiveAgentRouteIfNeeded(transcript) {
             return true
         }
+        if handleLocalBrowserNavigationIfNeeded(from: transcript) {
+            return true
+        }
+        if handleLocalBrowserSearchIfNeeded(from: transcript) {
+            return true
+        }
         if handleDirectComputerUseRequest(from: transcript, source: directComputerUseSource) {
             return true
         }
@@ -4961,6 +4996,403 @@ final class CompanionManager: ObservableObject {
             return true
         }
         return false
+    }
+
+    // MARK: - Local Browser Search (fully on-device)
+
+    /// Fully-local web assist: open the default browser to the results page,
+    /// then screenshot it and let the local multimodal model (Gemma) read the
+    /// results aloud via the local voice. No cloud, no API key. Only active when
+    /// Local-only mode is on; otherwise search requests fall through to the
+    /// cloud Agent Mode path.
+    private func handleLocalBrowserSearchIfNeeded(from transcript: String) -> Bool {
+        guard AppBundleConfiguration.localOnlyModeEnabled() else { return false }
+        let normalized = SpokenText.normalizedSpokenCommandText(transcript)
+        guard VoiceRouter.containsLocalBrowserSearchRequest(normalized)
+            || VoiceRouter.containsFreshResearchRequest(normalized) else { return false }
+        guard let query = Self.localBrowserSearchQuery(from: transcript),
+              let searchURL = Self.googleSearchURL(for: query) else { return false }
+
+        let timing = activeRequestTiming
+        let logFields: [String: Any] = [
+            "executor": "local_browser_search",
+            "executionMethod": "CompanionManager.handleLocalBrowserSearchIfNeeded",
+            "controller": "CompanionManager",
+            "query": query,
+            "url": searchURL.absoluteString,
+            "transcriptLength": transcript.count
+        ]
+        let executionStartedAt = markRequestExecutionStarted(
+            route: "voice.local_browser_search",
+            timing: timing,
+            extra: logFields
+        )
+
+        // 1) Open the default browser to the results page — pure local automation.
+        NSWorkspace.shared.open(searchURL)
+
+        // 2) Immediate spoken confirmation while the page loads.
+        speakShortSystemResponse(
+            "opening that in your browser. give me a moment to read the results.",
+            route: "voice.local_browser_search",
+            timing: timing,
+            executionStartedAt: executionStartedAt,
+            extra: logFields
+        )
+
+        // 3) Once it loads, screenshot it and have the local model read it aloud.
+        readBrowserSearchResultsAloud(query: query, originalTranscript: transcript)
+        return true
+    }
+
+    /// Waits for the results page to render, captures the screen, and streams a
+    /// short spoken summary from the local model into the active TTS voice.
+    private func readBrowserSearchResultsAloud(query: String, originalTranscript: String) {
+        let model = selectedModel
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            // Let the browser open and the results render before capturing.
+            try? await Task.sleep(for: .seconds(5))
+
+            let captures: [CompanionScreenCapture]
+            do {
+                captures = try await self.captureAllScreensForVoiceResponseIfAvailable()
+            } catch {
+                self.speakShortSystemResponse("i couldn't capture the screen to read the results.")
+                return
+            }
+            guard let capture = captures.first else {
+                self.speakShortSystemResponse("i couldn't see the browser to read the results.")
+                return
+            }
+
+            let image = (data: capture.imageData, label: "browser search results")
+            let session = self.voiceTTSClient.beginStreamingResponse { [weak self] in
+                self?.voiceState = .responding
+            }
+            let userPrompt = """
+            the user asked: "\(originalTranscript)". this is a screenshot of the search results page open in their browser for "\(query)". read the most useful results out loud in one or two short sentences — the direct answer, or the cheapest or top options with the key numbers. if the page is clearly still loading or empty, say that briefly instead.
+            """
+            do {
+                _ = try await self.analyzeLocalVoiceResponse(
+                    images: [image],
+                    model: model,
+                    systemPrompt: Self.localBrowserSearchReaderSystemPrompt,
+                    userPrompt: userPrompt,
+                    onTextChunk: { chunk in
+                        session.appendText(chunk)
+                    }
+                )
+                try await session.finish()
+            } catch {
+                session.cancel()
+                self.speakShortSystemResponse("i opened the page but couldn't read the results.")
+            }
+            if self.voiceState == .responding { self.voiceState = .idle }
+        }
+    }
+
+    /// Strips command/filler words and trailing "in my browser"-style phrases to
+    /// recover a clean search query from a spoken request.
+    static func localBrowserSearchQuery(from transcript: String) -> String? {
+        var query = SpokenText.cleanedAgentTaskInstruction(
+            SpokenText.normalizedAgentTaskInstruction(from: transcript)
+        )
+        let leadingPatterns = [
+            #"(?i)^\s*(?:please\s+)?(?:go\s+)?(?:and\s+)?(?:open\s+(?:my|the|a)?\s*browser\s+(?:and\s+)?)?(?:search(?:\s+for)?|google(?:\s+for)?|look\s+(?:up|for)|find(?:\s+me)?|browse\s+for|get\s+me)\s+"#
+        ]
+        for pattern in leadingPatterns {
+            query = query.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
+        }
+        let trailingPatterns = [
+            #"(?i)\s*(?:using|through|via|in|on|from)?\s*(?:my|the)\s+(?:default\s+)?(?:web\s+)?browser\s*$"#,
+            #"(?i)\s*(?:on\s+the\s+web|online|on\s+google|for\s+me)\s*$"#
+        ]
+        for pattern in trailingPatterns {
+            query = query.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
+        }
+        query = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        return SpokenText.wordCount(in: SpokenText.normalizedSpokenCommandText(query)) >= 2 ? query : nil
+    }
+
+    /// Builds a Google results URL for `query` (works for general search,
+    /// flights, prices, weather — Google renders inline widgets for those).
+    static func googleSearchURL(for query: String) -> URL? {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) else {
+            return nil
+        }
+        return URL(string: "https://www.google.com/search?q=\(encoded)")
+    }
+
+    private static let localBrowserSearchReaderSystemPrompt = """
+    you're clicky, reading a web page out loud for the user. you are looking at a screenshot of their browser showing search results. report only what is actually visible on the page. be concise and conversational, written for the ear: one or two short sentences, all lowercase, no markdown, no lists, no urls read out character by character. lead with the direct answer or the cheapest/top option and its key numbers. never invent prices, times, or facts that are not on screen. if the page looks like it is still loading or has no useful results, say so in a few words.
+    """
+
+    // MARK: - Local Browser Navigation (vision-driven, fully on-device)
+
+    /// Max perception->action steps before the loop gives up and reports back.
+    private static let maxBrowserNavigationSteps = 9
+
+    /// Multi-step local browser agent: open a site, then loop
+    /// screenshot -> local Gemma picks the next UI action -> execute it ->
+    /// screenshot again, until the goal is met. All on-device (Ollama + native
+    /// computer-use). Gated to Local-only mode. EXPERIMENTAL: Gemma's pixel
+    /// grounding is approximate, so clicks can miss on dense pages.
+    private func handleLocalBrowserNavigationIfNeeded(from transcript: String) -> Bool {
+        guard AppBundleConfiguration.localOnlyModeEnabled() else { return false }
+        let normalized = SpokenText.normalizedSpokenCommandText(transcript)
+        guard VoiceRouter.containsBrowserNavigationRequest(normalized) else { return false }
+        guard let start = Self.navigationStartURL(from: transcript) else { return false }
+
+        let timing = activeRequestTiming
+        let logFields: [String: Any] = [
+            "executor": "local_browser_navigation",
+            "executionMethod": "CompanionManager.handleLocalBrowserNavigationIfNeeded",
+            "controller": "CompanionManager",
+            "startURL": start.url.absoluteString,
+            "site": start.siteName,
+            "transcriptLength": transcript.count
+        ]
+        _ = markRequestExecutionStarted(
+            route: "voice.local_browser_navigation",
+            timing: timing,
+            extra: logFields
+        )
+
+        runLocalBrowserNavigation(goal: transcript, startURL: start.url, siteName: start.siteName)
+        return true
+    }
+
+    private func runLocalBrowserNavigation(goal: String, startURL: URL, siteName: String) {
+        let model = OpenClickyModelCatalog.voiceResponseModel(withID: selectedModel).id
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            guard OpenClickyComputerUsePermissionProbe.status().accessibilityGranted else {
+                self.speakShortSystemResponse("i need accessibility permission to control the browser. turn it on in system settings, privacy and security, accessibility.")
+                return
+            }
+            if !self.nativeComputerUseController.isEnabled {
+                self.nativeComputerUseController.setEnabled(true)
+            }
+
+            NSWorkspace.shared.open(startURL)
+            self.speakShortSystemResponse("opening \(siteName). give me a bit, i'll work through the page.")
+
+            var history: [String] = []
+            var lastSpoken = ""
+
+            for step in 0..<Self.maxBrowserNavigationSteps {
+                // Let the page or the previous action settle.
+                try? await Task.sleep(for: .seconds(step == 0 ? 4 : 2))
+
+                let captures: [CompanionScreenCapture]
+                do {
+                    captures = try await CompanionScreenCaptureUtility.captureCursorScreenAsJPEG()
+                } catch {
+                    self.speakShortSystemResponse("i couldn't see the screen to keep going.")
+                    return
+                }
+                guard let capture = captures.first else {
+                    self.speakShortSystemResponse("i couldn't capture the browser.")
+                    return
+                }
+
+                self.localLLMAPI.model = model
+                self.localLLMAPI.maxOutputTokens = 400
+                let userPrompt = Self.browserNavigationStepPrompt(
+                    goal: goal,
+                    history: history,
+                    screenshotWidth: capture.screenshotWidthInPixels,
+                    screenshotHeight: capture.screenshotHeightInPixels
+                )
+
+                let actionText: String
+                do {
+                    let (text, _) = try await self.localLLMAPI.analyzeImageStreaming(
+                        images: [(data: capture.imageData, label: "browser")],
+                        systemPrompt: Self.browserNavigationSystemPrompt,
+                        userPrompt: userPrompt,
+                        onTextChunk: { _ in }
+                    )
+                    actionText = text
+                } catch {
+                    self.speakShortSystemResponse("the local model stopped responding while navigating.")
+                    return
+                }
+
+                guard let action = Self.parseNavigationAction(from: actionText) else {
+                    history.append("step \(step + 1): no parseable action")
+                    continue
+                }
+                let type = (action["action"] as? String ?? "").lowercased()
+
+                switch type {
+                case "done", "finish", "answer":
+                    let summary = (action["summary"] as? String)
+                        ?? (action["text"] as? String)
+                        ?? (lastSpoken.isEmpty ? "done." : lastSpoken)
+                    self.speakShortSystemResponse(summary)
+                    return
+                case "say", "read":
+                    if let text = action["text"] as? String, !text.isEmpty {
+                        lastSpoken = text
+                        self.speakShortSystemResponse(text)
+                    }
+                    history.append("step \(step + 1): spoke an update")
+                case "open_url", "navigate":
+                    if let urlString = action["url"] as? String, let url = URL(string: urlString) {
+                        NSWorkspace.shared.open(url)
+                        history.append("step \(step + 1): opened \(urlString)")
+                    } else {
+                        history.append("step \(step + 1): open_url had no valid url")
+                    }
+                case "click":
+                    let label = (action["target"] as? String) ?? "an element"
+                    if let point = Self.actionScreenPoint(action, capture: capture) {
+                        try? self.nativeComputerUseController.click(at: point)
+                        history.append("step \(step + 1): clicked \(label)")
+                    } else {
+                        history.append("step \(step + 1): click had no coordinates")
+                    }
+                case "type":
+                    if let text = action["text"] as? String, !text.isEmpty {
+                        try? self.nativeComputerUseController.typeText(text)
+                        history.append("step \(step + 1): typed \(text)")
+                    } else {
+                        history.append("step \(step + 1): type had no text")
+                    }
+                case "key":
+                    let key = (action["key"] as? String ?? "").lowercased()
+                    let modifiers = (action["modifiers"] as? [String]) ?? []
+                    if !key.isEmpty {
+                        try? self.nativeComputerUseController.pressKey(key, modifiers: modifiers)
+                        history.append("step \(step + 1): pressed \(key)")
+                    } else {
+                        history.append("step \(step + 1): key had no name")
+                    }
+                case "scroll":
+                    let direction = (action["direction"] as? String ?? "down").lowercased()
+                    try? self.nativeComputerUseController.pressKey(direction == "up" ? "pageup" : "pagedown", modifiers: [])
+                    history.append("step \(step + 1): scrolled \(direction)")
+                case "wait":
+                    history.append("step \(step + 1): waited")
+                default:
+                    history.append("step \(step + 1): unknown action '\(type)'")
+                }
+            }
+
+            self.speakShortSystemResponse(
+                lastSpoken.isEmpty
+                    ? "i worked through several steps but couldn't confirm the result. take a look at the browser."
+                    : lastSpoken
+            )
+        }
+    }
+
+    /// Maps a model-supplied screenshot pixel coordinate to a global AppKit
+    /// screen point on the captured display (handles the top-left -> bottom-left
+    /// origin flip and the pixel -> point scale).
+    static func actionScreenPoint(_ action: [String: Any], capture: CompanionScreenCapture) -> CGPoint? {
+        func number(_ value: Any?) -> Double? {
+            if let d = value as? Double { return d }
+            if let i = value as? Int { return Double(i) }
+            if let s = value as? String { return Double(s) }
+            return nil
+        }
+        guard let pixelX = number(action["x"]), let pixelY = number(action["y"]) else { return nil }
+        let width = Double(max(1, capture.screenshotWidthInPixels))
+        let height = Double(max(1, capture.screenshotHeightInPixels))
+        let fracX = min(max(pixelX / width, 0), 1)
+        let fracY = min(max(pixelY / height, 0), 1)
+        let globalX = Double(capture.displayFrame.minX) + fracX * Double(capture.displayWidthInPoints)
+        let globalY = Double(capture.displayFrame.minY) + (1 - fracY) * Double(capture.displayHeightInPoints)
+        return CGPoint(x: globalX, y: globalY)
+    }
+
+    /// Extracts the first balanced JSON object from a model response (the model
+    /// may wrap it in stray prose despite instructions).
+    static func parseNavigationAction(from text: String) -> [String: Any]? {
+        guard let start = text.firstIndex(of: "{") else { return nil }
+        var depth = 0
+        var endIndex: String.Index?
+        var index = start
+        while index < text.endIndex {
+            let character = text[index]
+            if character == "{" {
+                depth += 1
+            } else if character == "}" {
+                depth -= 1
+                if depth == 0 { endIndex = index; break }
+            }
+            index = text.index(after: index)
+        }
+        guard let end = endIndex,
+              let data = String(text[start...end]).data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return object
+    }
+
+    /// Resolves the site to open from the spoken request: a known site root, or
+    /// a Google search for the cleaned query as a fallback.
+    static func navigationStartURL(from transcript: String) -> (url: URL, siteName: String)? {
+        let normalized = SpokenText.normalizedSpokenCommandText(transcript)
+        let knownSites: [(key: String, name: String, url: String)] = [
+            ("skyscanner", "skyscanner", "https://www.skyscanner.co.in"),
+            ("google flights", "google flights", "https://www.google.com/travel/flights"),
+            ("makemytrip", "makemytrip", "https://www.makemytrip.com"),
+            ("youtube", "youtube", "https://www.youtube.com"),
+            ("amazon", "amazon", "https://www.amazon.in"),
+            ("flipkart", "flipkart", "https://www.flipkart.com"),
+            ("wikipedia", "wikipedia", "https://www.wikipedia.org"),
+            ("gmail", "gmail", "https://mail.google.com"),
+            ("google maps", "google maps", "https://www.google.com/maps")
+        ]
+        for site in knownSites where normalized.contains(site.key) {
+            if let url = URL(string: site.url) { return (url, site.name) }
+        }
+        if let query = localBrowserSearchQuery(from: transcript),
+           let url = googleSearchURL(for: query) {
+            return (url, "your browser")
+        }
+        return nil
+    }
+
+    private static let browserNavigationSystemPrompt = """
+    you are clicky, controlling a web browser for the user, fully on-device. you are shown a screenshot of the current browser screen. output EXACTLY ONE next action as a single minified json object and NOTHING else — no prose, no markdown, no code fences. coordinates are in PIXELS of the screenshot you are given, with (0,0) at the top-left. only act on elements that are actually visible in the screenshot.
+
+    choose one action:
+    {"action":"click","x":<int>,"y":<int>,"target":"<short label>"}
+    {"action":"type","text":"<text to type into the focused field>"}
+    {"action":"key","key":"<return|escape|tab|down|up>","modifiers":[]}
+    {"action":"scroll","direction":"<down|up>"}
+    {"action":"open_url","url":"<https url>"}
+    {"action":"say","text":"<short spoken update for the user>"}
+    {"action":"done","summary":"<short spoken final answer with the key numbers>"}
+
+    rules:
+    - if a login, signup, cookie, or promo popup is covering the page, close it FIRST (click its x/close, or press escape).
+    - to fill a field, click it on one step, then use a type action on the next step.
+    - to change something like trip type or a date, click the control to open it, then click the option.
+    - when you have found what the user asked for (for example the cheapest flight and its price), output done with a one or two sentence spoken summary that includes the actual numbers you can see.
+    - never invent prices, dates, times, or text that is not visible in the screenshot.
+    - output only the single json object.
+    """
+
+    private static func browserNavigationStepPrompt(
+        goal: String,
+        history: [String],
+        screenshotWidth: Int,
+        screenshotHeight: Int
+    ) -> String {
+        let steps = history.isEmpty ? "none yet" : history.joined(separator: "; ")
+        return """
+        the user's goal: "\(goal)". the screenshot is \(screenshotWidth) by \(screenshotHeight) pixels. actions taken so far: \(steps). look at the current screenshot and decide the single best next action toward the goal. output one json action object only.
+        """
     }
 
     // MARK: - Companion Prompt
@@ -5116,6 +5548,7 @@ final class CompanionManager: ObservableObject {
     }
 
     private func startAgentTaskFromDeferredLiveAgentRouteIfNeeded(_ finalTranscript: String) -> Bool {
+        guard !AppBundleConfiguration.localOnlyModeEnabled() else { return false }
         let trimmedTranscript = finalTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedTranscript.isEmpty,
               let partialTranscript = deferredLiveAgentRoutePartial,
@@ -9161,6 +9594,8 @@ final class CompanionManager: ObservableObject {
     }
 
     private func startExplicitAgentTaskIfRequested(from transcript: String) -> Bool {
+        // Local-only mode: do not spin up the cloud Codex agent from voice/text.
+        guard !AppBundleConfiguration.localOnlyModeEnabled() else { return false }
         if let newTaskInstruction = Self.explicitNewTaskInstruction(from: transcript) {
             guard !newTaskInstruction.isEmpty else {
                 speakShortSystemResponse("what should the new task be?")
@@ -11429,6 +11864,9 @@ final class CompanionManager: ObservableObject {
     }
 
     static func implicitAgentTaskInstruction(from transcript: String) -> String? {
+        // Local-only mode keeps everything on-device: never auto-route voice to the
+        // cloud Codex agent (web search / OpenAI). Handled locally by Gemma instead.
+        guard !AppBundleConfiguration.localOnlyModeEnabled() else { return nil }
         let candidate = SpokenText.normalizedAgentTaskInstruction(from: transcript)
         let normalized = SpokenText.normalizedSpokenCommandText(candidate)
         guard SpokenText.wordCount(in: normalized) >= 3 else { return nil }
@@ -11456,6 +11894,7 @@ final class CompanionManager: ObservableObject {
     }
 
     private static func smartAgentRouteDecision(from transcript: String) -> SmartAgentRouteDecision? {
+        guard !AppBundleConfiguration.localOnlyModeEnabled() else { return nil }
         let candidate = SpokenText.normalizedAgentTaskInstruction(from: transcript)
         let normalized = SpokenText.normalizedSpokenCommandText(candidate)
         guard SpokenText.wordCount(in: normalized) >= 3 else { return nil }
@@ -11523,6 +11962,7 @@ final class CompanionManager: ObservableObject {
 
 
     static func hybridAgentTaskInstruction(from transcript: String) -> String? {
+        guard !AppBundleConfiguration.localOnlyModeEnabled() else { return nil }
         let candidate = SpokenText.normalizedCommandCandidate(from: transcript)
         let normalized = SpokenText.normalizedSpokenCommandText(candidate)
         guard SpokenText.wordCount(in: normalized) >= 5 else { return nil }
@@ -14642,6 +15082,7 @@ final class CompanionManager: ObservableObject {
     - default to one or two sentences. be direct and dense. sound like a capable coworker over the user's shoulder, not a formal report. if the user asks you to explain more or go deeper, give a thorough explanation with no length cap — but still no file edits, no commands, just words.
     - all lowercase, casual, warm. no emojis.
     - write for the ear, not the eye. short sentences. no lists, bullets, markdown, headings, tables, or code blocks.
+    - language: reply in the language the user is using or asks for. when replying in a non-english language, write it in that language's own native script, never romanized or transliterated into latin letters — for hindi use devanagari (फूलों की क्यारी), not "phoolon ki kyari"; for a hindi poem, all lines must be in devanagari. the local voice can only pronounce a language correctly from its native script. the "all lowercase" rule applies to latin scripts only; leave other scripts as written.
     - don't use abbreviations or symbols that sound weird read aloud. write "for example" not "e.g.", spell out small numbers.
     - never say "simply" or "just".
     - don't read out code verbatim. describe what code does conversationally.
@@ -14706,6 +15147,7 @@ final class CompanionManager: ObservableObject {
     - default to one or two sentences. be direct and dense. sound like a capable coworker over the user's shoulder, not a formal report. if the user asks you to explain more or go deeper, give a thorough explanation with no length cap — but still no file edits, no commands, just words.
     - all lowercase, casual, warm. no emojis.
     - write for the ear, not the eye. short sentences. no lists, bullets, markdown, headings, tables, or code blocks.
+    - language: reply in the language the user is using or asks for. when replying in a non-english language, write it in that language's own native script, never romanized or transliterated into latin letters — for hindi use devanagari (फूलों की क्यारी), not "phoolon ki kyari"; for a hindi poem, all lines must be in devanagari. the local voice can only pronounce a language correctly from its native script. the "all lowercase" rule applies to latin scripts only; leave other scripts as written.
     - don't use abbreviations or symbols that sound weird read aloud. write "for example" not "e.g.", spell out small numbers.
     - never say "simply" or "just".
     - don't read out code verbatim. describe what code does conversationally.
@@ -16201,7 +16643,7 @@ final class CompanionManager: ObservableObject {
         if wordCount <= 4 { return false }
         let acknowledgementPhrases: Set<String> = [
             "yes", "yeah", "yep", "no", "nope", "ok", "okay",
-            "alright", "all right", "sounds good", "thanks", "thank you",
+            "alright", "all right", "sounds good", "thanks", "thank you",
             "continue", "go on", "stop", "cancel", "nevermind", "never mind"
         ]
         if acknowledgementPhrases.contains(commandText) { return false }
@@ -16210,11 +16652,11 @@ final class CompanionManager: ObservableObject {
         // Those turns should either execute immediately or produce a
         // concrete handoff/status, not "yeah, that makes sense."
         let directActionPrefixes = [
-            "open ", "play ", "pause ", "click ", "press ", "type ",
+            "open ", "play ", "pause ", "click ", "press ", "type ",
             "select ", "scroll ", "switch ", "bring ", "move ",
             "close ", "quit ", "launch "
         ]
-        if directActionPrefixes.contains(where: commandText.hasPrefix) {
+        if directActionPrefixes.contains(where: commandText.hasPrefix) {
             return false
         }
 
@@ -16239,7 +16681,7 @@ final class CompanionManager: ObservableObject {
         // cached opener only when the user has asked a real multi-word
         // question or investigation. Short acknowledgements stay crisp.
         switch ttsProvider {
-        case .cartesia, .elevenLabs, .microsoftEdge, .deepgram:
+        case .cartesia, .elevenLabs, .microsoftEdge, .deepgram, .kokoro:
             return wordCount >= 6
         case .system:
             // The on-device voice speaks directly (no pre-baked PCM fillers).
@@ -18025,6 +18467,22 @@ nonisolated enum VoiceRouter {
     static func containsFreshResearchRequest(_ normalized: String) -> Bool {
         let researchPattern = #"\b(?:latest|live|price|news|weather|schedule|standings|research|look\s+up|search\s+(?:the\s+)?web|google|browse)\b"#
         return normalized.range(of: researchPattern, options: .regularExpression) != nil
+    }
+
+    /// Explicit "search the web / open the browser" intent used by the fully
+    /// local browser-search path (open default browser -> screenshot -> local
+    /// model reads results). Requires a clear search/browser cue so normal
+    /// requests are not hijacked.
+    static func containsLocalBrowserSearchRequest(_ normalized: String) -> Bool {
+        let pattern = #"\b(?:search(?:\s+for)?|google(?:\s+it)?|look\s+(?:up|it\s+up)|browse(?:\s+for)?|browser|on\s+the\s+web|online)\b"#
+        return normalized.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    /// Multi-step browser navigation intent (open a site, click, scroll, fill,
+    /// dismiss popups, find the cheapest option). Drives the local vision loop.
+    static func containsBrowserNavigationRequest(_ normalized: String) -> Bool {
+        let pattern = #"\b(?:navigate|go\s+to|open\s+(?:up\s+)?(?:skyscanner|youtube|amazon|flipkart|makemytrip|google\s+flights|gmail|wikipedia|maps)|skyscanner|makemytrip|click(?:\s+on)?|scroll|log\s+in|sign\s+in|cancel\s+(?:the\s+)?(?:signup|sign\s*up|pop\s*up|modal)|dismiss|fill\s+(?:in|out)?|select\s+the|choose\s+the|find\s+the\s+cheapest|book\s+(?:a|the))\b"#
+        return normalized.range(of: pattern, options: .regularExpression) != nil
     }
 
     static func isSensitiveOrDestructiveAgentTaskRequest(_ normalized: String) -> Bool {
