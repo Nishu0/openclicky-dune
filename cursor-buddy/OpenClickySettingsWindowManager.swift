@@ -187,6 +187,7 @@ struct OpenClickySettingsView: View {
     @AppStorage(AppBundleConfiguration.userCartesiaVoiceIDDefaultsKey) private var userCartesiaVoiceID = ""
     @AppStorage(AppBundleConfiguration.userOpenAIRealtimeVoiceIDDefaultsKey) private var userOpenAIRealtimeVoiceID = "cedar"
     @AppStorage(AppBundleConfiguration.userMicrosoftEdgeVoiceIDDefaultsKey) private var userMicrosoftEdgeVoiceID = "en-US-EmmaMultilingualNeural"
+    @AppStorage(AppBundleConfiguration.userKokoroVoiceIDDefaultsKey) private var userKokoroVoiceID = "af_heart"
     @AppStorage(AppBundleConfiguration.userDeepgramTTSVoiceDefaultsKey) private var userDeepgramTTSVoice = "aura-2-thalia-en"
     @AppStorage(AppBundleConfiguration.userDeepgramVoiceAgentThinkModelDefaultsKey) private var userDeepgramVoiceAgentThinkModel = "gpt-4o-mini"
     @AppStorage(AppBundleConfiguration.userVoiceResponseCaptionsEnabledDefaultsKey) private var voiceResponseCaptionsEnabled = false
@@ -202,6 +203,8 @@ struct OpenClickySettingsView: View {
     @State private var userCodexAgentAPIKey = ""
     @State private var userAssemblyAIAPIKey = ""
     @State private var userDeepgramAPIKey = ""
+    @AppStorage(AppBundleConfiguration.userLocalOnlyModeDefaultsKey) private var localOnlyModeEnabled = true
+    @AppStorage(AppBundleConfiguration.userAutoResumeAgentTasksOnLaunchDefaultsKey) private var autoResumeAgentTasksOnLaunch = false
     @AppStorage(AppBundleConfiguration.userMCPDeveloperDocsEnabledDefaultsKey) private var mcpDeveloperDocsEnabled = false
     @AppStorage(AppBundleConfiguration.userMCPComposioConnectEnabledDefaultsKey) private var mcpComposioConnectEnabled = false
     @AppStorage(AppBundleConfiguration.userMCPComputerUseEnabledDefaultsKey) private var mcpComputerUseEnabled = false
@@ -908,6 +911,21 @@ struct OpenClickySettingsView: View {
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 4)
+                case .kokoro:
+                    Text("Kokoro is a local neural voice (near-cloud quality) served by a local Kokoro server on http://127.0.0.1:8880 — no API key. Start the server first; override the URL with KOKORO_BASE_URL. Voices: af_heart, af_bella, af_sky, bf_emma, am_michael, etc.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 4)
+                    textFieldRow(
+                        title: "Kokoro voice",
+                        subtitle: "Kokoro voice name, e.g. af_heart or bf_emma.",
+                        systemImageName: "person.wave.2",
+                        placeholder: "af_heart",
+                        text: Binding(
+                            get: { userKokoroVoiceID },
+                            set: { userKokoroVoiceID = $0; companionManager.setKokoroVoiceID($0) }
+                        )
+                    )
                 }
             }
         }
@@ -1094,9 +1112,21 @@ struct OpenClickySettingsView: View {
 
             if companionManager.isAdvancedModeEnabled {
                 settingsGroup("Agent tools") {
+                    toggleRow(
+                        title: "Local-only mode (no web search or cloud agents)",
+                        subtitle: "On by default. Voice requests stay fully on-device (Gemma + local voice) and are never sent to the cloud Codex agent, web search, or your OpenAI/ChatGPT sign-in. Turn off to let requests like \"latest news\" spin up a cloud agent.",
+                        systemImageName: "lock.laptopcomputer",
+                        isOn: $localOnlyModeEnabled
+                    )
                     actionRow(title: "Warm up Agent Mode", systemImageName: "bolt") {
                         companionManager.warmUpCodexAgentMode()
                     }
+                    toggleRow(
+                        title: "Resume past tasks on launch",
+                        subtitle: "When on, OpenClicky re-opens and summarizes interrupted Agent Mode tasks from the previous run each time it starts. Off by default — restored tasks stay in the dashboard but are not auto-resumed.",
+                        systemImageName: "arrow.clockwise",
+                        isOn: $autoResumeAgentTasksOnLaunch
+                    )
                 }
 
                 #if DEBUG
